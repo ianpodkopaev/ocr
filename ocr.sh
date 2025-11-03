@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# OCR script with OCRopus normalization
+# OCR script with cropping and optional OCRopus normalization
 # Usage: ./ocr.sh run picture.jpg
 
 set -e
@@ -20,6 +20,7 @@ fi
 
 # Get base filename without extension
 BASENAME=$(basename "${INPUT_IMAGE%.*}")
+CROPPED_IMAGE="${BASENAME}.cropped.png"
 NORMALIZED_IMAGE="${BASENAME}.nrm.png"
 
 echo "=== OCR Processing ==="
@@ -32,8 +33,8 @@ if ! command -v tesseract &> /dev/null; then
     exit 1
 fi
 
-if ! command -v docker &> /dev/null; then
-    echo "Error: docker is not installed (needed for OCRopus)"
+if ! command -v convert &> /dev/null; then
+    echo "Error: ImageMagick (convert) is not installed (needed for cropping)"
     exit 1
 fi
 
@@ -43,36 +44,73 @@ INPUT_DIR=$(dirname "$INPUT_ABS")
 INPUT_FILE=$(basename "$INPUT_ABS")
 WORK_DIR=$(pwd)
 
-# Step 1: Normalize image using OCRopus via Docker
-echo "Step 1: Normalizing image with OCRopus..."
-docker run --rm -u $(id -u):$(id -g) \
-    -e HOME=/tmp \
-    -e MPLCONFIGDIR=/tmp/.matplotlib \
-    -v "$INPUT_DIR:/data" \
-    -v "$WORK_DIR:/output" \
-    kbai/ocropy \
-    ocropus-nlbin "/data/$INPUT_FILE" -o /output/temp_ocr_output
+# Step 0: Crop image to specified coordinates
+echo "Step 0: Cropping image to region 670x1005 to 828x1030..."
+convert "$INPUT_IMAGE" -crop 200x50+670+1005 "$CROPPED_IMAGE"
 
-# Find the normalized image (OCRopus creates it in a subdirectory)
-NORMALIZED_FILE=$(find "$WORK_DIR/temp_ocr_output" -name "*.bin.png" | head -n 1)
-
-if [ -z "$NORMALIZED_FILE" ] || [ ! -f "$NORMALIZED_FILE" ]; then
-    echo "Error: Normalization failed, no output file found"
-    rm -rf "$WORK_DIR/temp_ocr_output"
+if [ ! -f "$CROPPED_IMAGE" ]; then
+    echo "Error: Cropping failed"
     exit 1
 fi
 
-# Move normalized image to expected location
-mv "$NORMALIZED_FILE" "$NORMALIZED_IMAGE"
-rm -rf "$WORK_DIR/temp_ocr_output"
-
-echo "Normalized image saved as: $NORMALIZED_IMAGE"
+echo "Cropped image saved as: $CROPPED_IMAGE"
 echo ""
 
-# Step 2: Run Tesseract on original image
-echo "Step 2: Running Tesseract on original image..."
-tesseract "$INPUT_IMAGE" "${BASENAME}_original" -l rus
-echo "Original OCR output: ${BASENAME}_original.txt"
+# Step 1: Run Tesseract on cropped image
+echo "Step 1: Running Tesseract on cropped image..."
+tesseract "$CROPPED_IMAGE" "${BASENAME}_cropped" -l rus
+echo "Cropped OCR output: ${BASENAME}_cropped.txt"
+echo ""
+
+# Step 2: Try OCRopus normalization only if image is large enough
+echo "Step 2: Attempting OCRopus normalization..."
+if command -v docker &> /dev/null; then
+    # Check if image is tall enough for OCRopus (at least 100 pixels)
+    IMAGE_INFO=$(identify "$CROPPED_IMAGE" 2>/dev/null || echo "")
+    if [[ "$IMAGE_INFO" =~ ([0-9]+)x([0-9]+) ]]; then
+        WIDTH="${BASH_REMATCH[1]}"
+        HEIGHT="${BASH_REMATCH[2]}"
+        
+        if [ "$HEIGHT" -lt 100 ]; then
+            echo "Warning: Image too small for OCRopus (${HEIGHT}px tall, minimum 100px required)"
+            echo "Skipping OCRopus normalization, using simple ImageMagick normalization instead..."
+            
+            # Use ImageMagick for basic normalization
+            convert "$CROPPED_IMAGE" -colorspace Gray -normalize "$NORMALIZED_IMAGE"
+            echo "Basic normalized image saved as: $NORMALIZED_IMAGE"
+        else
+            # Use OCRopus for normalization
+            docker run --rm -u $(id -u):$(id -g) \
+                -e HOME=/tmp \
+                -e MPLCONFIGDIR=/tmp/.matplotlib \
+                -v "$WORK_DIR:/output" \
+                kbai/ocropy \
+                ocropus-nlbin "/output/$CROPPED_IMAGE" -o /output/temp_ocr_output -n
+
+            # Find the normalized image
+            NORMALIZED_FILE=$(find "$WORK_DIR/temp_ocr_output" -name "*.bin.png" | head -n 1)
+
+            if [ -n "$NORMALIZED_FILE" ] && [ -f "$NORMALIZED_FILE" ]; then
+                mv "$NORMALIZED_FILE" "$NORMALIZED_IMAGE"
+                rm -rf "$WORK_DIR/temp_ocr_output"
+                echo "OCROPus normalized image saved as: $NORMALIZED_IMAGE"
+            else
+                echo "Warning: OCRopus normalization failed, using ImageMagick fallback"
+                convert "$CROPPED_IMAGE" -colorspace Gray -normalize "$NORMALIZED_IMAGE"
+                echo "Basic normalized image saved as: $NORMALIZED_IMAGE"
+            fi
+        fi
+    else
+        echo "Warning: Could not get image dimensions, using ImageMagick normalization"
+        convert "$CROPPED_IMAGE" -colorspace Gray -normalize "$NORMALIZED_IMAGE"
+        echo "Basic normalized image saved as: $NORMALIZED_IMAGE"
+    fi
+else
+    echo "Warning: Docker not available, using ImageMagick for normalization"
+    convert "$CROPPED_IMAGE" -colorspace Gray -normalize "$NORMALIZED_IMAGE"
+    echo "Basic normalized image saved as: $NORMALIZED_IMAGE"
+fi
+
 echo ""
 
 # Step 3: Run Tesseract on normalized image
@@ -83,6 +121,7 @@ echo ""
 
 echo "=== Processing Complete ==="
 echo "Generated files:"
+echo "  - $CROPPED_IMAGE (cropped image)"
 echo "  - $NORMALIZED_IMAGE (normalized image)"
-echo "  - ${BASENAME}_original.txt (OCR from original)"
+echo "  - ${BASENAME}_cropped.txt (OCR from cropped)"
 echo "  - ${BASENAME}_normalized.txt (OCR from normalized)"
