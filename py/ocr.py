@@ -1,223 +1,132 @@
-#!/usr/bin/env python3
-
-import os
-import sys
+# ocr.py
 import cv2
-import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
 import pytesseract
-from pathlib import Path
+import os
+import re
+from db import ScanDatabase
 
 
-def check_dependencies():
-    """Check if required Python libraries are installed"""
-    try:
-        import cv2
-        import numpy as np
-        from PIL import Image
-        import pytesseract
-        return True
-    except ImportError as e:
-        print(f"Error: Missing dependency - {e}")
-        print("Please install required packages:")
-        print("pip install opencv-python pillow pytesseract")
-        return False
+class OCRProcessor:
+    def __init__(self, db_path='./db/scans.db'):
+        self.db = ScanDatabase(db_path)
 
+    def crop_region(self, image, x, y, w, h):
+        """Crop a specific region from the image"""
+        return image[y:y + h, x:x + w]
 
-def load_image(image_path):
-    """Load image using OpenCV"""
-    try:
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Could not load image from {image_path}")
-        return image
-    except Exception as e:
-        print(f"Error loading image: {e}")
-        sys.exit(1)
-
-
-def crop_image(image, x, y, width, height):
-    """Crop image region"""
-    return image[y:y + height, x:x + width]
-
-
-def save_image(image, output_path):
-    """Save image using OpenCV"""
-    cv2.imwrite(output_path, image)
-
-
-def normalize_image_opencv(image):
-    """Normalize image using OpenCV methods"""
-    # Convert to grayscale
-    if len(image.shape) == 3:
+    def preprocess_image(self, image):
+        """Preprocess image to improve OCR accuracy"""
+        # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
 
-    # Apply histogram equalization
-    equalized = cv2.equalizeHist(gray)
+        # Apply threshold to get binary image
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
 
-    # Apply Gaussian blur to reduce noise
-    blurred = cv2.GaussianBlur(equalized, (3, 3), 0)
+        return thresh
 
-    # Apply adaptive threshold
-    normalized = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
+    def extract_text_from_region(self, image, region_coords):
+        """Extract text from a specific region with preprocessing"""
+        x, y, w, h = region_coords
+        cropped_region = self.crop_region(image, x, y, w, h)
 
-    return normalized
+        # Preprocess the cropped region
+        processed_region = self.preprocess_image(cropped_region)
+
+        # Perform OCR with custom configuration
+        custom_config = r'--oem 3 --psm 6 -l rus'
+        ocr_text = pytesseract.image_to_string(processed_region, config=custom_config)
+
+        return ocr_text.strip()
+
+    def clean_extracted_text(self, text):
+        """Clean and format extracted text"""
+        # Remove extra whitespace and newlines
+        cleaned = ' '.join(text.split())
+
+        # Remove special characters but keep basic punctuation
+        cleaned = re.sub(r'[^\w\s\-/:.()]', '', cleaned)
+
+        return cleaned
+
+    def process_document_fields(self, image_path, field_regions):
+        """
+        Process specific fields from a document image
+
+        Args:
+            image_path: Path to the image file
+            field_regions: Dictionary defining regions for each field
+                         {'fname': (x,y,w,h), 'date': (x,y,w,h), 'departam': (x,y,w,h)}
+
+        Returns:
+            Dictionary with cleaned extracted text for each field
+        """
+        try:
+            # Load the image
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"Error: Could not load image from {image_path}")
+                return None
+
+            results = {}
+
+            # Process each field region
+            for field_name, region_coords in field_regions.items():
+                extracted_text = self.extract_text_from_region(image, region_coords)
+                cleaned_text = self.clean_extracted_text(extracted_text)
+                results[field_name] = cleaned_text
+
+                print(f"Extracted {field_name}: '{cleaned_text}'")
+
+            return results
+
+        except Exception as e:
+            print(f"Error processing image: {e}")
+            return None
+
+    def process_and_save_document(self, image_path, field_regions):
+        """
+        Complete workflow: extract fname, date, departam and save to database
+        """
+        # Extract fields from the image
+        extracted_data = self.process_document_fields(image_path, field_regions)
+
+        if extracted_data and all(key in extracted_data for key in ['fname', 'date', 'departam', 'unp']):
+            # Get the extracted values
+            fname = extracted_data['fname']
+            date = extracted_data['date']
+            departam = extracted_data['departam']
+            unp = extracted_data['unp']
 
 
-def normalize_image_pil(image):
-    """Normalize image using PIL methods"""
-    # Convert OpenCV image to PIL
-    if len(image.shape) == 3:
-        pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    else:
-        pil_image = Image.fromarray(image)
 
-    # Convert to grayscale
-    gray = pil_image.convert('L')
+            # Save to database
+            scan_id = self.db.insert_scan(fname, date, departam, unp)
+            print(f"Document scan saved to database with ID: {scan_id}")
 
-    # Enhance contrast
-    enhancer = ImageEnhance.Contrast(gray)
-    enhanced = enhancer.enhance(2.0)
-
-    # Enhance sharpness
-    sharpener = ImageEnhance.Sharpness(enhanced)
-    sharpened = sharpener.enhance(2.0)
-
-    # Convert back to OpenCV format
-    normalized = cv2.cvtColor(np.array(sharpened), cv2.COLOR_RGB2BGR)
-    return normalized
-
-
-def run_ocr(image, lang='rus'):
-    """Run Tesseract OCR on image"""
-    try:
-        # Convert OpenCV image to PIL for pytesseract
-        if len(image.shape) == 3:
-            pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            return scan_id, extracted_data
         else:
-            pil_image = Image.fromarray(image)
+            print("Failed to extract required fields from image")
+            return None, extracted_data
 
-        # Configure tesseract
-        config = '--oem 3 --psm 6'
-        if lang:
-            config += f' -l {lang}'
+    def visualize_field_regions(self, image_path, field_regions, output_path="./pic/document_with_fields.png"):
+        """Visualize where field regions are located on the document"""
+        image = cv2.imread(image_path)
 
-        text = pytesseract.image_to_string(pil_image, config=config)
-        return text.strip()
-    except Exception as e:
-        print(f"OCR Error: {e}")
-        return ""
-
-
-def process_region(image, region_name, crop_coords, basename):
-    """Process a single region (crop, normalize, OCR)"""
-    print(f"=== Processing {region_name} ===")
-
-    # Crop image
-    x, y, width, height = crop_coords
-    cropped = crop_image(image, x, y, width, height)
-    cropped_filename = f"./pic/{basename}.{region_name}_cropped.png"
-    save_image(cropped, cropped_filename)
-    print(f"Cropped image saved as: {cropped_filename}")
-
-    # Run OCR on cropped image
-    cropped_ocr = run_ocr(cropped)
-    cropped_text_filename = f"./txt/{basename}_{region_name}_cropped.txt"
-    with open(cropped_text_filename, 'w', encoding='utf-8') as f:
-        f.write(cropped_ocr)
-    print(f"Cropped OCR output: {cropped_text_filename}")
-    print(f"OCR Text: {cropped_ocr}")
-    print()
-
-    # Normalize image (try OpenCV method first)
-    normalized = normalize_image_opencv(cropped)
-    normalized_filename = f"./pic/{basename}.{region_name}_normalized.png"
-    save_image(normalized, normalized_filename)
-    print(f"Normalized image saved as: {normalized_filename}")
-
-    # Run OCR on normalized image
-    normalized_ocr = run_ocr(normalized)
-    normalized_text_filename = f"./txt/{basename}_{region_name}_normalized.txt"
-    with open(normalized_text_filename, 'w', encoding='utf-8') as f:
-        f.write(normalized_ocr)
-    print(f"Normalized OCR output: {normalized_text_filename}")
-    print(f"OCR Text: {normalized_ocr}")
-    print()
-
-    return {
-        'cropped_file': cropped_filename,
-        'normalized_file': normalized_filename,
-        'cropped_text_file': cropped_text_filename,
-        'normalized_text_file': normalized_text_filename,
-        'cropped_ocr': cropped_ocr,
-        'normalized_ocr': normalized_ocr
-    }
-
-
-def main():
-
-
-    # if len(sys.argv) != 3 or sys.argv[1] != "run":
-    #     print("Usage: python ocr_script.py run <image.jpg>")
-    #     sys.exit(1)
-    print("Input pic path")
-    input_image=input()
-    if not os.path.isfile(input_image):
-        print(f"Error: File '{input_image}' not found")
-        sys.exit(1)
-
-    if not check_dependencies():
-        sys.exit(1)
-
-    print("=== OCR Processing ===")
-    print(f"Input image: {input_image}")
-    print()
-
-    # Get base filename
-    basename = Path(input_image).stem
-
-    # Load image
-    image = load_image(input_image)
-
-    # Define crop regions
-    regions = {
-        'region1': {
-            'name': 'Region 1 (670x1005 to 828x1030)',
-            'coords': (670, 1005, 200, 50)  # x, y, width, height
-        },
-        'region2': {
-            'name': 'Region 2 (135x833 to 300x865)',
-            'coords': (140, 835, 160, 50)  # x, y, width, height
+        # Define colors for different fields
+        colors = {
+            'fname': (0, 255, 0),  # Green
+            'date': (255, 0, 0),  # Blue
+            'departam': (0, 0, 255),  # Red
+            'unp': (0,0,0) #black
         }
-    }
 
-    results = {}
+        for field_name, (x, y, w, h) in field_regions.items():
+            color = colors.get(field_name, (255, 255, 0))  # Yellow for unknown fields
+            # Draw rectangle around each field region
+            cv2.rectangle(image, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(image, field_name, (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-    # Process each region
-    for region_key, region_info in regions.items():
-        results[region_key] = process_region(
-            image,
-            region_key,
-            region_info['coords'],
-            basename
-        )
-
-    # Print summary
-    print("=== Processing Complete ===")
-    for region_key, region_info in regions.items():
-        result = results[region_key]
-        print(f"Generated files for {region_info['name']}:")
-        print(f"  - {result['cropped_file']} (cropped image)")
-        print(f"  - {result['normalized_file']} (normalized image)")
-        print(f"  - {result['cropped_text_file']} (OCR from cropped)")
-        print(f"  - {result['normalized_text_file']} (OCR from normalized)")
-        print()
-
-
-if __name__ == "__main__":
-    main()
+        # Save the image with field regions
+        cv2.imwrite(output_path, image)
+        print(f"Field regions visualization saved to: {output_path}")
